@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 檢舉＋封鎖小幫手
 // @namespace    threads-report-block
-// @version      0.2.0
+// @version      0.3.6
 // @description  在 Threads 個人主頁一鍵走完「檢舉＋封鎖」選單；內建名單佇列，J 跳下一個。每次只處理目前這一個帳號。
 // @downloadURL  https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
 // @updateURL    https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
@@ -16,6 +16,7 @@
   'use strict';
 
   const REASONS = [
+    '可能未滿最低年齡限制',
     '這是機器人程式或假帳號',
     '這是垃圾訊息',
     '仇恨言論或象徵符號',
@@ -28,6 +29,8 @@
   const load = () => GM_getValue('state', { queue: [], idx: 0, done: {}, reason: REASONS[0], stepMode: true, lastAction: 0 });
   const save = (s) => GM_setValue('state', s);
   let state = load();
+  // 0.3.2 起預設理由改成 REASONS[0]；舊版存過的理由重設一次
+  if (!state.reasonV2) { state.reason = REASONS[0]; state.reasonV2 = true; save(state); }
 
   // 一行一個帳號：「https://www.threads.com/@xxx 理由」或「@xxx 理由」
   function parseList(text) {
@@ -98,16 +101,46 @@
     await sleep(900);
   }
 
+  // 最內層那個含「位粉絲」的元素（數字本身包在子 span 裡，所以不能要求沒有子元素）
+  const followersRow = () => [...document.querySelectorAll('span,div')].find(
+    (e) => visible(e) && /位粉絲/.test(e.textContent) && ![...e.children].some((c) => /位粉絲/.test(c.textContent)) && !panel.contains(e)
+  );
+
+  // 主頁：點「N 位粉絲」打開粉絲視窗，一路往下捲把帳號全部收進來。
+  // 連 3 輪捲不出新帳號就停；中途把視窗關掉＝停下，已抓到的照收。
+  async function grabFollowers() {
+    const target = currentHandle();
+    const row = followersRow();
+    if (!row) throw new Error('找不到「N 位粉絲」，請先捲回主頁最上面');
+    row.click();
+    const dlg = await waitFor(() => [...document.querySelectorAll('[role="dialog"]')].filter(visible).pop(), 5000);
+    if (!dlg) throw new Error('點了「位粉絲」但沒跳出粉絲視窗');
+    await sleep(1500);
+    const handles = new Set();
+    let idle = 0;
+    while (idle < 3 && document.contains(dlg)) {
+      const before = handles.size;
+      for (const a of dlg.querySelectorAll('a[href]')) {
+        const h = (a.getAttribute('href').match(/^(?:https:\/\/www\.threads\.(?:com|net))?\/@([A-Za-z0-9._]+)\/?$/) || [])[1];
+        if (h && h !== target) handles.add(h);
+      }
+      idle = handles.size === before ? idle + 1 : 0;
+      msg(`抓粉絲中…已 ${handles.size} 個（關掉粉絲視窗＝停）`);
+      // 捲最底下那層可捲動的容器
+      const box = [...dlg.querySelectorAll('div')].filter((d) => d.scrollHeight > d.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(d).overflowY)).pop();
+      if (box) box.scrollTop = box.scrollHeight;
+      await sleep(1500);
+    }
+    return [...handles].map((handle) => ({ handle, note: `@${target} 的粉絲（未逐一查證）` }));
+  }
+
   // 頁面上有很多顆 ⋯：頂端列一顆、頭像旁一顆、每篇貼文各一顆。
   // 頭像旁那顆 = 「N 位粉絲」同一行右邊那排圖示（IG、鈴鐺、⋯）裡最右邊那顆。
   // 不靠 aria-label 認，只靠位置，頂端列那顆跟粉絲數不同行會被排除。
   async function openProfileMenu() {
     // 錨點＝「N 位粉絲」那一行（IG、鈴鐺、⋯ 跟它同一行）。
     // 不用「追蹤」按鈕當錨點：按鈕文字會變（追蹤／追蹤對方／追蹤中），左側欄也有個「追蹤中」會認錯。
-    const row = [...document.querySelectorAll('span,div')].find(
-      // 最內層那個含「位粉絲」的元素（數字本身包在子 span 裡，所以不能要求沒有子元素）
-      (e) => visible(e) && /位粉絲/.test(e.textContent) && ![...e.children].some((c) => /位粉絲/.test(c.textContent)) && !panel.contains(e)
-    );
+    const row = followersRow();
     if (!row) throw new Error('找不到「N 位粉絲」那一行，沒辦法定位頭像旁的 ⋯（請先捲回主頁最上面）');
     const rr = row.getBoundingClientRect();
     const mid = (rr.top + rr.bottom) / 2;
@@ -130,12 +163,25 @@
     await openProfileMenu();
     await step('檢舉', findByText('檢舉', '[role="menuitem"]'));
     await step('檢舉個人檔案', await waitFor(() => findByText('檢舉個人檔案')));
-    await step('內容不應該顯示在 Threads 上', await waitFor(() => findByText('該帳號發佈的內容不應該顯示在 Threads 上。') || findByText('該帳號發佈的內容不應該顯示在 Threads 上')));
-    // 點下理由就直接送出檢舉，沒有另外的提交頁
-    await step(`${reason}（點下去就會送出檢舉）`, await waitFor(() => findByText(reason)));
+    if (reason === '可能未滿最低年齡限制') {
+      // 這個理由跟「內容不應該顯示…」同一頁，直接點。
+      // 字面完全相等會對不到（可能夾了看不見的字元），改成找「含『年齡』、字最少」的可點元素
+      const ageRow = () => [...document.querySelectorAll('[role="button"],[role="menuitem"],[role="link"],button,[tabindex]')]
+        .filter((e) => visible(e) && !panel.contains(e) && /年齡/.test(e.innerText) && e.innerText.length < 40)
+        .sort((a, b) => a.innerText.length - b.innerText.length)[0];
+      await step(reason, await waitFor(ageRow));
+      // 接著是「關於檢舉未滿最低年齡限制的用戶」說明頁，按底下黑色「檢舉」鈕才送出
+      await waitFor(() => findByText('關於檢舉未滿最低年齡限制的用戶', 'span,div,h1,h2'));
+      await step('說明頁的「檢舉」（點下去就會送出檢舉）', await waitFor(() => findByText('檢舉', '[role="button"],button')));
+    } else {
+      await step('內容不應該顯示在 Threads 上', await waitFor(() => findByText('該帳號發佈的內容不應該顯示在 Threads 上。') || findByText('該帳號發佈的內容不應該顯示在 Threads 上')));
+      // 點下理由就直接送出檢舉，沒有另外的提交頁
+      await step(`${reason}（點下去就會送出檢舉）`, await waitFor(() => findByText(reason)));
+    }
     // 成功頁：「謝謝你的意見回饋」＋「完成」
-    const ok = await waitFor(() => findByText('謝謝你的意見回饋', 'span,div,h1,h2'), 5000);
-    if (!ok) throw new Error('沒看到「謝謝你的意見回饋」，檢舉可能沒送出，已停下（沒有封鎖）。請看一下畫面。');
+    // 年齡理由的成功頁標題不同：「謝謝你檢舉這個個人檔案」
+    const ok = await waitFor(() => findByText('謝謝你的意見回饋', 'span,div,h1,h2') || findByText('謝謝你檢舉這個個人檔案', 'span,div,h1,h2'), 5000);
+    if (!ok) throw new Error('沒看到「謝謝你的意見回饋／謝謝你檢舉這個個人檔案」，檢舉可能沒送出，已停下（沒有封鎖）。請看一下畫面。');
     const done = await waitFor(() => findByText('完成', '[role="button"],button'), 2000);
     if (done) done.click();
     else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -174,9 +220,11 @@
           理由：${item ? (item.note || '<span style="color:#f90">未查證</span>') : '<span style="opacity:.6">不在佇列</span>'}</div>` : `<div style="margin:6px 0;opacity:.7">打開某個帳號的主頁才能操作</div>
           ${/\/post\//.test(location.pathname) ? '<button id="trb-grab" style="width:100%;margin-bottom:6px">抓這篇貼文裡列的帳號</button>' : ''}`}
         <select id="trb-reason" style="width:100%;margin-bottom:6px">${REASONS.map((r) => `<option ${r === state.reason ? 'selected' : ''}>${r}</option>`).join('')}</select>
+        ${h ? '<button id="trb-fans" style="width:100%;margin-bottom:6px">抓他的粉絲進佇列</button>' : ''}
         <div style="display:flex;gap:6px">
           <button id="trb-rb" ${h ? '' : 'disabled'} style="flex:1">檢舉＋封鎖</button>
           <button id="trb-b" ${h ? '' : 'disabled'}>只封鎖</button>
+          <button id="trb-skip" ${h ? '' : 'disabled'} title="快捷鍵 K：記成已略過，不會再跳回來">略過 K</button>
           <button id="trb-next" title="快捷鍵 J">下一個 J</button>
         </div>
         <label style="display:block;margin-top:6px"><input type="checkbox" id="trb-step" ${state.stepMode ? 'checked' : ''}> 逐步模式（每點一步先問）</label>
@@ -191,12 +239,27 @@
     panel.querySelector('#trb-step').onchange = (e) => { state.stepMode = e.target.checked; save(state); };
     panel.querySelector('#trb-rb').onclick = () => run(true);
     panel.querySelector('#trb-b').onclick = () => run(false);
+    panel.querySelector('#trb-skip').onclick = skip;
     panel.querySelector('#trb-next').onclick = next;
     const grab = panel.querySelector('#trb-grab');
     if (grab) grab.onclick = () => {
       const added = grabFromPost().filter((q) => !state.queue.some((x) => x.handle === q.handle));
       state.queue.push(...added); save(state); render();
       msg(`從這頁抓到並新增 ${added.length} 個（重複的已略過）。只抓得到畫面上已展開的留言。`);
+    };
+    const fans = panel.querySelector('#trb-fans');
+    if (fans) fans.onclick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const added = (await grabFollowers()).filter((q) => !state.queue.some((x) => x.handle === q.handle));
+        state.queue.push(...added); save(state); render();
+        msg(`粉絲新增 ${added.length} 個（重複的已略過）。粉絲不等於網軍，建議先看一眼再決定檢舉或只封鎖。`);
+      } catch (e) {
+        msg(e.message);
+      } finally {
+        busy = false;
+      }
     };
     panel.querySelector('#trb-load').onclick = () => {
       // 文字框被 Threads 擋掉貼上時，改用瀏覽器原生的輸入框
@@ -245,11 +308,21 @@
     location.href = `/@${todo.handle}`;
   }
 
+  // 看過覺得是正常人：記成已略過，佇列繞回來也不會再停在這裡
+  function skip() {
+    const h = currentHandle();
+    if (busy || !h) return;
+    state.done[h] = '已略過';
+    save(state); render();
+    next();
+  }
+
   document.addEventListener('keydown', (e) => {
-    if (e.key !== 'j' && e.key !== 'J') return;
+    const k = e.key.toLowerCase();
+    if (k !== 'j' && k !== 'k') return;
     const t = e.target;
     if (t && (t.isContentEditable || /INPUT|TEXTAREA|SELECT/.test(t.tagName))) return;
-    next();
+    k === 'j' ? next() : skip();
   });
 
   // Threads 是單頁應用，換頁不會重新載入；網址變了就重畫面板
