@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 檢舉＋封鎖小幫手
 // @namespace    threads-report-block
-// @version      0.3.6
+// @version      0.4.0
 // @description  在 Threads 個人主頁一鍵走完「檢舉＋封鎖」選單；內建名單佇列，J 跳下一個。每次只處理目前這一個帳號。
 // @downloadURL  https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
 // @updateURL    https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
@@ -26,7 +26,7 @@
   const COOLDOWN_MS = 8000;
 
   // ---------- 狀態（存在 Tampermonkey，不離開你的電腦） ----------
-  const load = () => GM_getValue('state', { queue: [], idx: 0, done: {}, reason: REASONS[0], stepMode: true, lastAction: 0 });
+  const load = () => GM_getValue('state', { queue: [], idx: 0, done: {}, reason: REASONS[0], stepMode: true, auto: false, lastAction: 0 });
   const save = (s) => GM_setValue('state', s);
   let state = load();
   // 0.3.2 起預設理由改成 REASONS[0]；舊版存過的理由重設一次
@@ -96,7 +96,7 @@
 
   async function step(label, el) {
     if (!el) throw new Error(`找不到「${label}」`);
-    if (state.stepMode && !confirm(`逐步模式：下一步要點「${label}」，確定？`)) throw new Error('你取消了');
+    if (state.stepMode && !state.auto && !confirm(`逐步模式：下一步要點「${label}」，確定？`)) throw new Error('你取消了');
     el.click();
     await sleep(900);
   }
@@ -228,6 +228,7 @@
           <button id="trb-next" title="快捷鍵 J">下一個 J</button>
         </div>
         <label style="display:block;margin-top:6px"><input type="checkbox" id="trb-step" ${state.stepMode ? 'checked' : ''}> 逐步模式（每點一步先問）</label>
+        <label style="display:block" title="勾了就一個接一個自動檢舉＋封鎖，中間自己等 ${COOLDOWN_MS / 1000} 秒冷卻；按 Esc 或取消勾選就停"><input type="checkbox" id="trb-auto" ${state.auto ? 'checked' : ''}> 自動連續檢舉＋封鎖（自己等冷卻，Esc 停）</label>
         <div id="trb-msg" style="margin-top:6px;color:#9cf;min-height:1em"></div>
         <details style="margin-top:6px"><summary>貼名單</summary>
           <textarea id="trb-list" rows="5" style="width:100%" placeholder="一行一個：&#10;https://www.threads.com/@xxx 理由"></textarea>
@@ -237,6 +238,7 @@
     panel.querySelector('#trb-min').onclick = () => { const b = panel.querySelector('#trb-body'); b.style.display = b.style.display === 'none' ? '' : 'none'; };
     panel.querySelector('#trb-reason').onchange = (e) => { state.reason = e.target.value; save(state); };
     panel.querySelector('#trb-step').onchange = (e) => { state.stepMode = e.target.checked; save(state); };
+    panel.querySelector('#trb-auto').onchange = (e) => setAuto(e.target.checked);
     panel.querySelector('#trb-rb').onclick = () => run(true);
     panel.querySelector('#trb-b').onclick = () => run(false);
     panel.querySelector('#trb-skip').onclick = skip;
@@ -290,10 +292,23 @@
       if (state.queue.some((q) => !state.done[q.handle])) { msg('完成，1.5 秒後跳下一個…'); await sleep(1500); next(); }
       else msg('完成');
     } catch (e) {
-      msg(e.message);
+      if (state.auto) {
+        // 自動模式下失敗就記下來往下走，不然會卡在同一個帳號一直重試
+        state.done[h] = `自動失敗：${e.message}`;
+        save(state); render();
+        msg(`${e.message}，已記成失敗，1.5 秒後跳下一個…`);
+        await sleep(1500); next();
+      } else msg(e.message);
     } finally {
       busy = false;
     }
+  }
+
+  function setAuto(on) {
+    state.auto = on; save(state);
+    const box = panel.querySelector('#trb-auto');
+    if (box) box.checked = on;
+    msg(on ? '自動模式開了，會一個接一個處理' : '自動模式已停');
   }
 
   function next() {
@@ -318,6 +333,7 @@
   }
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && state.auto) { setAuto(false); return; }
     const k = e.key.toLowerCase();
     if (k !== 'j' && k !== 'k') return;
     const t = e.target;
@@ -338,6 +354,16 @@
     save(state); render();
     msg('這個帳號已不存在，1.5 秒後跳下一個…');
     setTimeout(next, 1500);
+  }, 500);
+
+  // 自動模式：目前這頁在佇列裡又還沒處理，就等冷卻時間到自動按「檢舉＋封鎖」；做完 run() 會自己跳下一個
+  setInterval(() => {
+    if (!state.auto || busy || skipping) return;
+    const h = currentHandle();
+    if (!h || state.done[h] || !state.queue.some((q) => q.handle === h)) return;
+    const wait = state.lastAction + COOLDOWN_MS - Date.now();
+    if (wait > 0) { msg(`自動模式：冷卻中，${Math.ceil(wait / 1000)} 秒後處理 @${h}（Esc 停）`); return; }
+    run(true);
   }, 500);
   render();
 })();
