@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Threads 檢舉＋封鎖小幫手
 // @namespace    threads-report-block
-// @version      0.4.0
+// @version      0.4.1
 // @description  在 Threads 個人主頁一鍵走完「檢舉＋封鎖」選單；內建名單佇列，J 跳下一個。每次只處理目前這一個帳號。
 // @downloadURL  https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
 // @updateURL    https://github.com/davidberger1210/threads-report-block/raw/main/threads-report-block.user.js
@@ -175,8 +175,12 @@
       await step('說明頁的「檢舉」（點下去就會送出檢舉）', await waitFor(() => findByText('檢舉', '[role="button"],button')));
     } else {
       await step('內容不應該顯示在 Threads 上', await waitFor(() => findByText('該帳號發佈的內容不應該顯示在 Threads 上。') || findByText('該帳號發佈的內容不應該顯示在 Threads 上')));
-      // 點下理由就直接送出檢舉，沒有另外的提交頁
-      await step(`${reason}（點下去就會送出檢舉）`, await waitFor(() => findByText(reason)));
+      await step(reason, await waitFor(() => findByText(reason)));
+      // 有些理由（例如仇恨言論）點下去會先跳「…守則」說明頁，底下黑色「提交檢舉」才送出；
+      // 其他理由直接到成功頁。兩種都等，看先出現哪個。
+      const thanks = () => findByText('謝謝你的意見回饋', 'span,div,h1,h2') || findByText('謝謝你檢舉這個個人檔案', 'span,div,h1,h2');
+      const next = await waitFor(() => thanks() || findByText('提交檢舉', '[role="button"],button'));
+      if (next && !thanks()) await step('提交檢舉（點下去就會送出檢舉）', next);
     }
     // 成功頁：「謝謝你的意見回饋」＋「完成」
     // 年齡理由的成功頁標題不同：「謝謝你檢舉這個個人檔案」
